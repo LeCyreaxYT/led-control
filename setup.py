@@ -34,6 +34,7 @@ def is_raspberrypi():
 requirements = [
     'Flask==2.2.2',
     'RestrictedPython>=5.2',
+    'Flask-Cors>=3.0.10',
     'sacn>=1.8.1',
     'HAP-python==4.4.0',
     'pyopenssl==22.1.0',
