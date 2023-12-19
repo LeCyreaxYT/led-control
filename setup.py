@@ -34,6 +34,7 @@ def is_raspberrypi():
 requirements = [
     'Flask==2.2.2',
     'RestrictedPython>=5.2',
+    'Flask-Cors>=3.0.10',
     'sacn>=1.8.1',
     'HAP-python==4.4.0',
     'pyopenssl==22.1.0',
@@ -44,10 +45,11 @@ requirements = [
 
 extensions = [
     Extension('_ledcontrol_rpi_ws281x_driver',
-              sources=['ledcontrol/driver/ledcontrol_rpi_ws281x_driver_wrap.c'],
-              include_dirs=['ledcontrol/driver'],
-              library_dirs=['ledcontrol/driver/rpi_ws281x/'],
-              libraries=['ws2811'])
+        sources=['ledcontrol/driver/ledcontrol_rpi_ws281x_driver_wrap.c'],
+        include_dirs=['ledcontrol/driver'],
+        library_dirs=['ledcontrol/driver/rpi_ws281x/'],
+        libraries=['ws2811']
+    )
 ]
 
 setup(

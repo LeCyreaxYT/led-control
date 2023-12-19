@@ -1,44 +1,64 @@
 # led-control WS2812B LED Controller Server
-# Copyright 2022 jackw01. Released under the MIT License (see LICENSE for details).
+# Copyright 2021 jackw01. Released under the MIT License (see LICENSE for details).
 
 import json
 import atexit
-import shutil
-import traceback
+from dataclasses import dataclass, field
 from threading import Timer
 from pathlib import Path
 from flask import Flask, render_template, request, jsonify
+from flask_cors import CORS
 from ledcontrol.animationcontroller import AnimationController
 from ledcontrol.ledcontroller import LEDController
-from ledcontrol.homekit import homekit_start
 
 import ledcontrol.pixelmappings as pixelmappings
-import ledcontrol.animationfunctions as animfunctions
+import ledcontrol.animationpatterns as animpatterns
 import ledcontrol.colorpalettes as colorpalettes
 import ledcontrol.utils as utils
+import os
+
+import ledcontrol.chapel_serial as chapel_serial
+
+import logging
+
+logging.basicConfig(format='%(asctime)s %(levelname)s %(message)s', level=logging.INFO)
+logger = logging.getLogger()
+
+# Data class for form items
+@dataclass
+class FormItem:
+    control: str
+    key: str = 'None'
+    type: type = None
+    min: float = 0
+    max: float = 1
+    step: float = 0.01
+    options: list = field(default_factory=list)
+    val: float = 0
+    label: str = ''
+    unit: str = ''
+    hide: bool = False
 
 def create_app(led_count,
-               config_file,
-               pixel_mapping_file,
+               pixel_mapping,
                refresh_rate,
                led_pin,
                led_data_rate,
                led_dma_channel,
                led_pixel_order,
-               led_brightness_limit,
+               led_color_correction,
+               led_v_limit,
                save_interval,
                enable_sacn,
-               enable_hap,
-               no_timer_reset,
-               dev):
+               no_timer_reset):
     app = Flask(__name__)
 
+    cors = CORS(app, resources={r"*": {"origins": "*"}})
+
     # Create pixel mapping function
-    if pixel_mapping_file is not None:
-        pixel_mapping = json.load(pixel_mapping_file)
-        pixel_mapping_file.close()
+    if pixel_mapping is not None:
+        print(f'Using pixel mapping from file ({len(pixel_mapping)} LEDs)')
         led_count = len(pixel_mapping)
-        print(f'Using pixel mapping from file ({led_count} LEDs)')
         mapping_func = pixelmappings.from_array(pixel_mapping)
     else:
         print(f'Using default linear pixel mapping ({led_count} LEDs)')
@@ -53,22 +73,18 @@ def create_app(led_count,
                                      refresh_rate,
                                      led_count,
                                      mapping_func,
+                                     led_color_correction,
                                      enable_sacn,
-                                     no_timer_reset,
-                                     led_brightness_limit)
+                                     no_timer_reset)
 
-    presets = {}
-    functions = dict(animfunctions.default)
+    patterns = dict(animpatterns.default)
 
     # Create file if it doesn't exist already
-    if config_file is not None:
-        filename = Path(config_file)
-    else:
-        filename = Path('/etc') / 'ledcontrol.json'
+    filename = Path('/etc') / 'ledcontrol.json'
     filename.touch(exist_ok=True)
 
-    # Init controller params and custom animations from settings file
-    with filename.open('r') as data_file:
+    # Init controller params and custom patterns from settings file
+    with open(str(filename), mode='r') as data_file:
         try:
             settings_str = data_file.read()
             # Apply updates to old versions of settings file
@@ -77,211 +93,262 @@ def create_app(led_count,
                                                 'pattern(t, dt, x, y, z, prev_state)')
             settings = json.loads(settings_str)
 
-            if 'save_version' not in settings:
-                print(f'Detected an old save file version at {filename}. Making a backup to {filename}.bak.')
-                shutil.copyfile(filename, filename.with_suffix('.json.bak'))
+            # Enforce brightness limit
+            settings['params']['brightness'] = min(
+                settings['params']['brightness'], led_v_limit)
 
-                # Rename 'params' and recreate as 'settings'
-                params = settings.pop('params')
-                settings['settings'] = {
-                    'global_brightness': params['brightness'],
-                    'global_color_temp': params['color_temp'],
-                    'global_color_r': 1.0,
-                    'global_color_g': 1.0,
-                    'global_color_b': 1.0,
-                    'global_saturation': params['saturation'],
-                    'groups': {
-                        'main': {
-                            'range_start': 0,
-                            'range_end': 100000,
-                            'render_mode': 'local',
-                            'render_target': '',
-                            'mapping': [],
-                            'name': 'main',
-                            'brightness': 1.0,
-                            'color_temp': 6500,
-                            'saturation': 1.0,
-                            'function': 0,
-                            'speed': params['primary_speed'],
-                            'scale': params['primary_scale'],
-                            'palette': 0,
-                        }
-                    }
-                }
+            # Set controller params, recalculate things that depend on params
+            controller.params.update(settings['params'])
+            controller.params['sacn'] = 0
+            controller.calculate_color_correction()
+            controller.calculate_mappings()
 
-                # Add default flag to animation patterns
-                for k in settings['patterns']:
-                    if 'source' in settings['patterns'][k]:
-                        settings['patterns'][k]['default'] = False
-                    else:
-                        settings['patterns'][k]['default'] = True
-
-                # Rename 'patterns'
-                settings['functions'] = settings.pop('patterns')
-
-                # Add default flag to palettes
-                for k in settings['palettes']:
-                    settings['palettes'][k]['default'] = False
-
-                print('Successfully upgraded save file.')
-
-            # Enforce calibration off when starting up
-            settings['settings']['calibration'] = 0
-
-            # Set controller settings, (automatically) recalculate things that depend on them
-            controller.update_settings(settings['settings'])
-
-            # Read presets
-            if 'presets' in settings:
-                presets.update(settings['presets'])
-
-            # Read custom animations and changed params for default animations
-            for k, v in settings['functions'].items():
-                if v['default'] == False:
-                    functions[int(k)] = v
+            # Read custom patterns and changed params for default patterns
+            for k, v in settings['patterns'].items():
+                # JSON keys are always strings
+                if int(k) not in animpatterns.default and 'source' in v:
+                    patterns[int(k)] = v
                     controller.set_pattern_function(int(k), v['source'])
-                elif int(k) in functions:
-                    functions[int(k)].update(v)
+                else:
+                    patterns[int(k)].update(v)
 
             # Read color palettes
-            for k, v in settings['palettes'].items():
-                controller.set_palette(int(k), v)
-            controller.calculate_palette_tables()
+            controller.palettes.update({int(k): v for k, v in settings['palettes'].items()})
+            controller.calculate_palette_table()
+            print(f'Loaded saved settings from {filename}.')
 
-            print(f'Loaded saved settings from {filename}')
+        except Exception:
+            print(f'Some saved settings at {filename} are out of date or invalid, ignoring.')
 
-        except Exception as e:
-            if settings_str == '':
-                print(f'Creating new settings file at {filename}.')
-            else:
-                print(f'Some saved settings at {filename} are out of date or invalid. Making a backup of the old file to {filename}.error and creating a new one with default settings.')
-                shutil.copyfile(filename, filename.with_suffix('.json.error'))
+    # Define form and create user-facing labels based on keys
+    form = [
+        FormItem('range', 'brightness', float, 0, led_v_limit, 0.05),
+        FormItem('range', 'color_temp', int, 1000, 12000, 10, unit='K'),
+        #FormItem('range', 'gamma', float, 0.01, 3),
+        FormItem('range', 'saturation', float, 0, 1),
+        FormItem('select', 'primary_pattern', int),
+        FormItem('range', 'primary_speed', float, 0, 2, unit='Hz'),
+        FormItem('range', 'primary_scale', float, -10, 10),
+        FormItem('code'),
+        FormItem('select', 'secondary_pattern', int,
+                 options=list(animpatterns.default_secondary_names.values()),
+                 val=controller.params['secondary_pattern']),
+        FormItem('range', 'secondary_speed', float, 0.01, 2, unit='Hz'),
+        FormItem('range', 'secondary_scale', float, -10, 10),
+        FormItem('select', 'palette', int),
+        FormItem('colors'),
+    ]
 
-    @app.before_request
-    def before_request():
-        'Log post request json for testing'
-        if dev and request.method == 'POST':
-            print(request.endpoint)
-            print(request.json)
+    for item in form:
+        item.label = utils.snake_to_title(item.key)
+
+    if enable_sacn:
+        form.append(FormItem('select', 'sacn', int,
+                             options=['Off', 'On'], label='E1.31 sACN Receiver Mode'))
 
     @app.route('/')
-    def index():
+    def get_control():
+        'Returns a simpler HTML controller page'
+        for item in form:
+            if (item.key in controller.params):
+                item.val = item.type(controller.params[item.key])
+        return render_template('simple-control-public.html',
+                               form=form)
+
+    @app.route('/bambi-control')
+    def get_control_bambi():
+        'Returns a simpler HTML controller page'
+        for item in form:
+            if (item.key in controller.params):
+                item.val = item.type(controller.params[item.key])
+        return render_template('simple-control-bambi.html',
+                               form=form)
+
+    @app.route('/dream-chapel')
+    def get_control_helmond():
+        'Returns a simpler HTML controller page'
+        for item in form:
+            if (item.key in controller.params):
+                item.val = item.type(controller.params[item.key])
+
+        ports = chapel_serial.list_ports()
+        for port, desc, hwid in sorted(ports):
+            logger.info("{}: {} [{}]".format(port, desc, hwid))
+            if port == '/dev/ttyACM0':
+                chapel_serial.connect_serial(port)
+            elif port == '/dev/ttyACM1':
+                chapel_serial.connect_serial(port)
+
+        return render_template('simple-control-dream-chapel.html',
+                               form=form)
+
+    @app.route('/set-fountain')
+    def set_fountain():
+        'Control the fountains'
+        logger.info("/set-fountain")
+        key = request.args.get('key', type=int)
+        value = json.loads(request.args.get('value', type=str))
+        logger.info(f"key: {key}, value: {value}")
+        # Create packet
+        packet = bytearray()
+        packet.append(ord(f"{value}"[0]))
+
+        chapel_serial.serial_send_command(packet)
+        return jsonify(result='')
+
+    @app.route('/ping')
+    def get_ping():
+        'Simple check to see if server is online'
+        return "pong"
+
+    @app.route('/pattern-setup')
+    def get_setup():
         'Returns web app page'
-        return app.send_static_file('index.html')
+        for item in form:
+            if (item.key in controller.params):
+                item.val = item.type(controller.params[item.key])
+        return render_template('setup.html',
+                               form=form)
 
-    @app.get('/getsettings')
-    def get_settings():
-        'Get settings'
-        return jsonify(controller.get_settings())
+    @app.route('/_shutdown')
+    def get_shutdown():
+        'Shutdown the RPi'
+        os.system('sudo shutdown -h now')
+        return "Shutting down"
 
-    @app.post('/updatesettings')
-    def update_settings():
-        'Update settings'
-        new_settings = request.json
-        controller.update_settings(new_settings)
+    @app.route('/_update')
+    def get_update():
+        'Pull the latest code from git'
+        os.system('sudo -u pi git -C /home/pi/led-control pull origin artur; sleep 2; sudo reboot')
+        return "Pulled code, rebooting"
+
+    @app.route('/setparam')
+    def set_param():
+        'Sets a key/value pair in controller parameters'
+        key = request.args.get('key', type=str)
+        value = request.args.get('value')
+        logger.info(f"/setparam key: {key}, value: {value}")
+        form_item = next(filter(lambda i: i.key == key, form))
+        if key == 'primary_pattern':
+            save_current_pattern_params()
+            controller.set_param('primary_speed', patterns[int(value)]['primary_speed'])
+            controller.set_param('primary_scale', patterns[int(value)]['primary_scale'])
+
+        value = form_item.type(value)
+        if form_item.control == 'range':
+            value = utils.clamp(value, form_item.min, form_item.max)
+        controller.set_param(key, value)
         return jsonify(result='')
 
-    @app.get('/getpresets')
-    def get_presets():
-        'Get presets'
-        return jsonify(presets)
+    @app.route('/getpatternparams')
+    def get_pattern_params():
+        'Returns pattern parameters for the given pattern in JSON dict form'
+        key = request.args.get('key', type=int)
+        return jsonify(speed=patterns[key]['primary_speed'],
+                       scale=patterns[key]['primary_scale'])
 
-    @app.post('/updatepreset')
-    def update_preset():
-        'Update a preset'
-        presets[request.json['key']] = request.json['value']
-        return jsonify(result='')
+    @app.route('/getpatternsources')
+    def get_pattern_sources():
+        'Returns pattern sources in JSON dict form'
+        return jsonify(sources={k: v['source'] for k, v in patterns.items()},
+                       names={k: v['name'] for k, v in patterns.items()},
+                       defaults=list(animpatterns.default.keys()),
+                       current=controller.params['primary_pattern'])
 
-    @app.post('/removepreset')
-    def remove_preset():
-        'Remove a preset'
-        del presets[request.json['key']]
-        return jsonify(result='')
-
-    @app.post('/removegroup')
-    def remove_group():
-        'Remove a group'
-        controller.delete_group(request.json['key'])
-        return jsonify(result='')
-
-    @app.get('/getfunctions')
-    def get_functions():
-        'Get functions'
-        return jsonify(functions)
-
-    @app.post('/compilefunction')
-    def compile_function():
-        'Compiles a function, returns errors and warnings in JSON array form'
-        key = request.json['key']
-        errors, warnings = controller.set_pattern_function(key, functions[key]['source'])
+    @app.route('/compilepattern')
+    def compile_pattern():
+        'Compiles a pattern, returns errors and warnings in JSON array form'
+        key = request.args.get('key', type=int)
+        source = request.args.get('source', type=str)
+        if key not in patterns:
+            patterns[key] = {
+                'name': key,
+                'primary_speed': controller.params['primary_speed'],
+                'primary_scale': controller.params['primary_scale']
+            }
+        patterns[key]['source'] = source
+        errors, warnings = controller.set_pattern_function(key, source)
         return jsonify(errors=errors, warnings=warnings)
 
-    @app.post('/updatefunction')
-    def update_function():
-        'Update a function'
-        functions[request.json['key']] = request.json['value']
+    @app.route('/setpatternname')
+    def set_pattern_name():
+        'Sets a pattern name for the given key'
+        key = request.args.get('key', type=int)
+        name = request.args.get('name', type=str)
+        patterns[key]['name'] = name
         return jsonify(result='')
 
-    @app.post('/removefunction')
-    def remove_function():
-        'Remove a function'
-        del functions[request.json['key']]
+    @app.route('/deletepattern')
+    def delete_pattern():
+        'Deletes a pattern'
+        key = request.args.get('key', type=int)
+        del patterns[key]
         return jsonify(result='')
 
-    @app.get('/getpalettes')
+    @app.route('/getpalettes')
     def get_palettes():
-        'Get palettes'
-        return jsonify(controller.get_palettes())
+        'Returns palettes in JSON dict form'
+        return jsonify(palettes=controller.palettes,
+                       defaults=list(colorpalettes.default.keys()),
+                       current=controller.params['palette'])
 
-    @app.post('/updatepalette')
-    def update_palette():
-        'Update a palette'
-        controller.set_palette(request.json['key'], request.json['value'])
-        controller.calculate_palette_table(request.json['key'])
+    @app.route('/setpalette')
+    def set_palette():
+        'Sets a palette'
+        key = request.args.get('key', type=int)
+        value = json.loads(request.args.get('value', type=str))
+        controller.set_palette(key, value)
+        controller.calculate_palette_table()
         return jsonify(result='')
 
-    @app.post('/removepalette')
-    def remove_palette():
-        'Remove a palette'
-        controller.delete_palette(request.json['key'])
+    @app.route('/deletepalette')
+    def delete_palette():
+        'Deletes a palette'
+        key = request.args.get('key', type=int)
+        controller.delete_palette(key)
         return jsonify(result='')
 
-    @app.get('/getfps')
+    @app.route('/getfps')
     def get_fps():
         'Returns latest animation frames per second'
-        return jsonify(fps=controller.get_frame_rate())
+        return jsonify(fps=controller.timer.get_rate())
 
-    @app.get('/resettimer')
+    @app.route('/resettimer')
     def reset_timer():
         'Resets animation timer'
         controller.reset_timer()
         return jsonify(result='')
 
+    def save_current_pattern_params():
+        'Remembers speed and scale for current pattern'
+        patterns[controller.params['primary_pattern']]['primary_speed']\
+            = controller.params['primary_speed']
+        patterns[controller.params['primary_pattern']]['primary_scale']\
+            = controller.params['primary_scale']
+
     def save_settings():
-        'Save controller settings, patterns, and palettes'
-        functions_2 = {}
-        for k, v in functions.items():
-            if not v['default']:
-                functions_2[str(k)] = v
+        'Save controller settings'
+        save_current_pattern_params()
+        patterns_save, palettes_save = {}, {}
+        for k, v in patterns.items():
+            if k not in animpatterns.default:
+                patterns_save[k] = v
             else:
-                functions_2[str(k)] = {n: v[n] for n in ('default', 'primary_speed', 'primary_scale')}
-
-        palettes_2 = {str(k): v for (k, v) in controller.get_palettes().items() if not v['default']}
-
+                patterns_save[k] = {n: v[n] for n in ('primary_speed', 'primary_scale')}
+        for k, v in controller.palettes.items():
+            if k not in colorpalettes.default:
+                palettes_save[k] = v
         data = {
-            'save_version': 2,
-            'settings': controller.get_settings(),
-            'presets': presets,
-            'functions': functions_2,
-            'palettes': palettes_2,
+            'params': controller.params,
+            'patterns': patterns_save,
+            'palettes': palettes_save,
         }
-        with filename.open('w') as data_file:
+        with open(str(filename), 'w') as data_file:
             try:
                 json.dump(data, data_file, sort_keys=True, indent=4)
-                print(f'Saved settings to {filename}')
-            except Exception as e:
-                traceback.print_exc()
-                print(f'Could not save settings to {filename}')
+                print(f'Saved settings to {filename}.')
+            except Exception:
+                print(f'Could not save settings to {filename}.')
 
     def auto_save_settings():
         'Timer for automatically saving settings'
@@ -295,21 +362,5 @@ def create_app(led_count,
     atexit.register(controller.clear_leds)
     atexit.register(controller.end_animation)
     auto_save_settings()
-
-    if enable_hap:
-        def setter_callback(char_values):
-            new_settings = {}
-            if 'On' in char_values:
-                new_settings['on'] = char_values['On']
-            if 'Brightness' in char_values:
-                new_settings['global_brightness'] = char_values['Brightness'] / 100.0
-            if 'Saturation' in char_values:
-                new_settings['global_saturation'] = char_values['Saturation'] / 100.0
-            controller.update_settings(new_settings)
-
-        hap_accessory = homekit_start(setter_callback)
-        hap_accessory.on.set_value(controller.get_settings()['on'])
-        hap_accessory.brightness.set_value(controller.get_settings()['global_brightness'] * 100.0)
-        hap_accessory.saturation.set_value(controller.get_settings()['global_saturation'] * 100.0)
 
     return app
