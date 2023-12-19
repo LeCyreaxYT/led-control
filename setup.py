@@ -45,10 +45,11 @@ requirements = [
 
 extensions = [
     Extension('_ledcontrol_rpi_ws281x_driver',
-              sources=['ledcontrol/driver/ledcontrol_rpi_ws281x_driver_wrap.c'],
-              include_dirs=['ledcontrol/driver'],
-              library_dirs=['ledcontrol/driver/rpi_ws281x/'],
-              libraries=['ws2811'])
+        sources=['ledcontrol/driver/ledcontrol_rpi_ws281x_driver_wrap.c'],
+        include_dirs=['ledcontrol/driver'],
+        library_dirs=['ledcontrol/driver/rpi_ws281x/'],
+        libraries=['ws2811']
+    )
 ]
 
 setup(
